@@ -362,12 +362,62 @@ def whole_MCTS(circuit_name, max_steps=10, simulations=100):
 
 # ---
 
+import re
+
+def create(state):
+    synthesisOpToPosDic = {
+        0: "refactor",
+        1: "refactor -z",
+        2: "rewrite",
+        3: "rewrite -z",
+        4: "resub",
+        5: "resub -z",
+        6: "balance"
+    }
+    circuit_name, actions = state.split('_')
+    circuit_path = './InitialAIG/train/' + circuit_name + '.aig'
+    next_state = './tmp/' + state + '.aig'
+    action_cmd = ''
+    for action in actions:
+        action_cmd += (synthesisOpToPosDic[int(action)] + ' ; ')
+    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; {action_cmd} read_lib {lib_file}; write {next_state}; print_stats\" > {log_file}"
+    os.system(abc_run_cmd)
+
+    return next_state
+
+def evaluate(circuit_path, lib_file):
+    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; read_lib {lib_file}; map; topo; stime\" > {log_file}"
+    os.system(abc_run_cmd)
+    
+    with open(log_file) as f:
+        area_information = re.findall('[a-zA-Z0-9.]+', f.readlines()[-1])
+        eval = float(area_information[-9]) * float(area_information[-4])
+    return eval
+
+def regularize(circuit_path, lib_file, eval):
+    next_state = circuit_path.split('.aig')[0] + '_resyn.aig'
+    next_bench = next_state.split('.aig')[0] + '.bench'
+    resyn2_cmd = "balance; rewrite; refactor; balance; rewrite; rewrite -z; balance; refactor -z; rewrite -z; balance;"
+    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; {resyn2_cmd} read_lib {lib_file}; write {next_state}; write_bench -l {next_bench}; map; topo; stime\" > {log_file}"
+    os.system(abc_run_cmd)
+
+    with open(log_file) as f:
+        area_information = re.findall('[a-zA-Z0-9.]+', f.readlines()[-1])
+        baseline = float(area_information[-9]) * float(area_information[-4])
+        eval = 1 - eval / baseline
+    return eval
+
 def calc(circuit_name, actions):
-    pass
+    state = circuit_name + '_' + actions
+    aig = create(state)
+    eval = evaluate(aig, lib_file)
+    eval = regularize(aig, lib_file, eval)
+    print(circuit_name, '-', actions, ' ', eval)
+    return eval
 
 def getPath(circuit_name):
     print("beam_search:")
-    beam_score, beam_actions = beam_search(circuit_name, 3, 5)
+    beam_score, beam_actions = beam_search(circuit_name, 10, 3)
     best_score = beam_score
     print(beam_score, ' * ', beam_actions)
     print("A_star:")
