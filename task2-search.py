@@ -9,7 +9,6 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import abc_py
 
-# 确定设备
 if torch.backends.mps.is_available():
     print("Metal is available!")
     device = torch.device("mps")
@@ -20,7 +19,6 @@ else:
     print("Metal is not available.")
     device = torch.device("cpu")
 
-# 定义路径
 dataset_path = './small'
 aig_path = './tmp'
 yosys_path = '/home/zhangcy/ml/oss-cad-suite/bin/'
@@ -29,12 +27,10 @@ log_file = 'log/alu2.log'
 model0_path = './save/model_sage_epoch_1400.pth'
 model1_path = './save/model_epoch_150.pth'
 
-# 使用 yosys-abc 处理 AIG 文件
 def run_yosys_abc(circuit_path, action_cmd, next_state):
     abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; {action_cmd} read_lib {lib_file}; write {next_state}; print_stats\" > {log_file}"
     os.system(abc_run_cmd)
 
-# 处理AIG文件并生成图数据
 def process_aig_file(circuit_path):
     _abc = abc_py.AbcInterface()
     _abc.start()
@@ -90,13 +86,11 @@ def process_aig_file(circuit_path):
 
     return data
 
-# 创建图数据对象
 def create_graph_data(data):
     edge_index = data['edge_index']
     x = torch.cat([data['node_type'].view(-1, 1), data['num_inverted_predecessors'].view(-1, 1)], dim=1).float()
     return Data(x=x, edge_index=edge_index)
 
-# 改进后的GraphSAGE模型定义
 class GraphSAGE(torch.nn.Module):
     def __init__(self):
         super(GraphSAGE, self).__init__()
@@ -108,20 +102,18 @@ class GraphSAGE(torch.nn.Module):
         self.bn3 = BatchNorm(128)
         self.fc1 = torch.nn.Linear(128, 64)
         self.fc2 = torch.nn.Linear(64, 1)
-        self.dropout = torch.nn.Dropout(0.5)  # 增加Dropout防止过拟合
+        self.dropout = torch.nn.Dropout(0.5)
 
     def forward(self, data):
         x, edge_index, batch = data.x, data.edge_index, data.batch
         x = F.relu(self.bn1(self.conv1(x, edge_index)))
         x = F.relu(self.bn2(self.conv2(x, edge_index)))
         x = F.relu(self.bn3(self.conv3(x, edge_index)))
-        x = global_mean_pool(x, batch)  # 使用全局平均池化层
+        x = global_mean_pool(x, batch)
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
         return x
-
-# 加载模型
 
 model0 = GraphSAGE().to(device)
 model0.load_state_dict(torch.load(model0_path, map_location=device))
@@ -133,12 +125,13 @@ model1.eval()
 
 # search part
 
+# --- model eval --- #
+
 def eval(circuit_name, actions, mode=0):
-    circuit_path = f'./InitialAIG/train/{circuit_name}.aig'
+    circuit_path = f'./InitialAIG/test/{circuit_name}.aig'
     next_state = f'./tmp/{circuit_name}_{actions}.aig'
     
     if not os.path.exists(next_state):
-        # 定义 Yosys ABC 操作命令
         synthesis_op_to_pos_dic = {
             0: "refactor",
             1: "refactor -z",
@@ -153,15 +146,12 @@ def eval(circuit_name, actions, mode=0):
         for action in actions:
             action_cmd += (synthesis_op_to_pos_dic[int(action)] + '; ')
 
-        # 运行 Yosys ABC 生成新的 AIG 文件
         run_yosys_abc(circuit_path, action_cmd, next_state)
 
-    # 处理AIG文件并生成图数据
     data = process_aig_file(next_state)
     graph_data = create_graph_data(data)
-    graph_data.batch = torch.zeros(graph_data.num_nodes, dtype=torch.long)  # 添加batch属性
-        
-    # 进行预测
+    graph_data.batch = torch.zeros(graph_data.num_nodes, dtype=torch.long)
+
     with torch.no_grad():
         graph_data = graph_data.to(device)
         if mode == 0:
@@ -170,9 +160,71 @@ def eval(circuit_name, actions, mode=0):
             prediction = model1(graph_data).cpu().numpy()[0]
         return prediction
 
+# --- yosys calc --- #
+
+import re
+
+def create(state):
+    synthesisOpToPosDic = {
+        0: "refactor",
+        1: "refactor -z",
+        2: "rewrite",
+        3: "rewrite -z",
+        4: "resub",
+        5: "resub -z",
+        6: "balance"
+    }
+    circuit_name, actions = state.split('_')
+    circuit_path = './InitialAIG/test/' + circuit_name + '.aig'
+    next_state = './tmp/' + state + '.aig'
+    action_cmd = ''
+    for action in actions:
+        action_cmd += (synthesisOpToPosDic[int(action)] + ' ; ')
+    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; {action_cmd} read_lib {lib_file}; write {next_state}; print_stats\" > {log_file}"
+    os.system(abc_run_cmd)
+
+    return next_state
+
+def evaluate(circuit_path, lib_file):
+    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; read_lib {lib_file}; map; topo; stime\" > {log_file}"
+    os.system(abc_run_cmd)
+    
+    with open(log_file) as f:
+        area_information = re.findall('[a-zA-Z0-9.]+', f.readlines()[-1])
+        eval = float(area_information[-9]) * float(area_information[-4])
+    return eval
+
+def regularize(circuit_path, lib_file, eval):
+    next_state = circuit_path.split('.aig')[0] + '_resyn.aig'
+    next_bench = next_state.split('.aig')[0] + '.bench'
+    resyn2_cmd = "balance; rewrite; refactor; balance; rewrite; rewrite -z; balance; refactor -z; rewrite -z; balance;"
+    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; {resyn2_cmd} read_lib {lib_file}; write {next_state}; write_bench -l {next_bench}; map; topo; stime\" > {log_file}"
+    os.system(abc_run_cmd)
+
+    with open(log_file) as f:
+        area_information = re.findall('[a-zA-Z0-9.]+', f.readlines()[-1])
+        baseline = float(area_information[-9]) * float(area_information[-4])
+        eval = 1 - eval / baseline
+    return eval
+
+best_actions = "0"
+best_score = -100
+
+def calc(circuit_name, actions):
+    state = circuit_name + '_' + actions
+    aig = create(state)
+    eval = evaluate(aig, lib_file)
+    eval = regularize(aig, lib_file, eval)
+    global best_actions
+    global best_score
+    if best_score < eval:
+        best_score = eval
+        best_actions = actions
+    return eval
+
 # --- dfs --- #
 
-def dfs(circuit_name, cur_depth, cur_actions, best_score=float('-inf'), best_actions="", max_depth=10):
+def dfs(circuit_name, cur_depth, cur_actions, best_score=float('-inf'), best_actions="", max_depth=10, pa_score=-1):
     if cur_depth == max_depth:
         score = eval(circuit_name, cur_actions, 0)
         if score > best_score:
@@ -182,9 +234,12 @@ def dfs(circuit_name, cur_depth, cur_actions, best_score=float('-inf'), best_act
 
     for action in "0123456":
         actions = cur_actions + action
-        score = eval(circuit_name, actions, 0) + eval(circuit_name, actions, 1)
+        # score = eval(circuit_name, actions, 0) + eval(circuit_name, actions, 1)
+        score = calc(circuit_name, actions)
+        if score == pa_score:
+            continue
         if score > best_score:
-            best_score, best_actions = dfs(circuit_name, cur_depth + 1, actions, best_score, best_actions, max_depth)
+            best_score, best_actions = dfs(circuit_name, cur_depth + 1, actions, best_score, best_actions, max_depth, score)
 
     return best_score, best_actions
 
@@ -226,7 +281,7 @@ def beam_search(circuit_name, max_depth=10, beam_width=10):
         for cur_score, cur_actions in beam:
             for action in "0123456":
                 actions = cur_actions + action
-                score = eval(circuit_name, actions, 0) + eval(circuit_name, actions, 1)
+                score = calc(circuit_name, actions) + eval(circuit_name, actions, 1)
                 heappush(new_beam, (score, actions))
 
         # Keep only the top beam_width states
@@ -242,7 +297,7 @@ from queue import PriorityQueue
 
 def Astar(circuit_name, max_depth=10):
     open_set = PriorityQueue()
-    open_set.put((-eval(circuit_name, "", 0), ""))  # (cur_score, cur_actions)
+    open_set.put((-eval(circuit_name, "", 0)-eval(circuit_name, "", 1), ""))  # (cur_score, cur_actions)
     closed_set = set()
 
     while not open_set.empty():
@@ -260,7 +315,8 @@ def Astar(circuit_name, max_depth=10):
             actions = cur_actions + action
 
             if actions not in closed_set:
-                g = eval(circuit_name, actions, 0)  # Current cost to reach this state
+                # g = eval(circuit_name, actions, 0)  # Current cost to reach this state
+                g = calc(circuit_name, actions)
                 h = eval(circuit_name, actions, 1)  # Heuristic future cost
                 f = g + h  # Combined cost
 
@@ -304,7 +360,8 @@ def rollout(circuit_name, actions, remaining_steps):
     for _ in range(remaining_steps):
         action = random.choice(["0", "1", "2", "3", "4", "5", "6"])
         cur_actions = cur_actions + action
-    return eval(circuit_name, cur_actions, 0) + eval(circuit_name, cur_actions, 1), cur_actions
+    # return eval(circuit_name, cur_actions, 0) + eval(circuit_name, cur_actions, 1), cur_actions
+    return calc(circuit_name, cur_actions), cur_actions
 
 def backpropagate(node, reward):
     while node is not None:
@@ -343,7 +400,6 @@ def MCTS(circuit_name, init_actions="", max_steps=10, simulations=100):
         # Backpropagation
         backpropagate(node, reward)
 
-    # 返回访问次数最多的节点的路径
     best_child = max(root.children, key=lambda c: c.visits)
     node = best_child
     while node.parent is not None:
@@ -356,115 +412,55 @@ def whole_MCTS(circuit_name, max_steps=10, simulations=100):
     
     while len(actions) < max_steps:
         action = MCTS(circuit_name, actions, max_steps - len(actions), simulations)
-        actions = actions + action
+        actions = actions + action[len(actions)]
     
     return eval(circuit_name, actions, 0), actions
 
-# ---
+# --- search --- #
 
-import re
+def getPath(circuit_name, threshold=0.1):
+    # initialize
+    global best_actions
+    global best_score
+    best_actions = "0"
+    calc(circuit_name, best_actions)
 
-def create(state):
-    synthesisOpToPosDic = {
-        0: "refactor",
-        1: "refactor -z",
-        2: "rewrite",
-        3: "rewrite -z",
-        4: "resub",
-        5: "resub -z",
-        6: "balance"
-    }
-    circuit_name, actions = state.split('_')
-    circuit_path = './InitialAIG/train/' + circuit_name + '.aig'
-    next_state = './tmp/' + state + '.aig'
-    action_cmd = ''
-    for action in actions:
-        action_cmd += (synthesisOpToPosDic[int(action)] + ' ; ')
-    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; {action_cmd} read_lib {lib_file}; write {next_state}; print_stats\" > {log_file}"
-    os.system(abc_run_cmd)
-
-    return next_state
-
-def evaluate(circuit_path, lib_file):
-    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; read_lib {lib_file}; map; topo; stime\" > {log_file}"
-    os.system(abc_run_cmd)
-    
-    with open(log_file) as f:
-        area_information = re.findall('[a-zA-Z0-9.]+', f.readlines()[-1])
-        eval = float(area_information[-9]) * float(area_information[-4])
-    return eval
-
-def regularize(circuit_path, lib_file, eval):
-    next_state = circuit_path.split('.aig')[0] + '_resyn.aig'
-    next_bench = next_state.split('.aig')[0] + '.bench'
-    resyn2_cmd = "balance; rewrite; refactor; balance; rewrite; rewrite -z; balance; refactor -z; rewrite -z; balance;"
-    abc_run_cmd = f"{yosys_path}yosys-abc -c \"read {circuit_path}; {resyn2_cmd} read_lib {lib_file}; write {next_state}; write_bench -l {next_bench}; map; topo; stime\" > {log_file}"
-    os.system(abc_run_cmd)
-
-    with open(log_file) as f:
-        area_information = re.findall('[a-zA-Z0-9.]+', f.readlines()[-1])
-        baseline = float(area_information[-9]) * float(area_information[-4])
-        eval = 1 - eval / baseline
-    return eval
-
-def calc(circuit_name, actions):
-    state = circuit_name + '_' + actions
-    aig = create(state)
-    eval = evaluate(aig, lib_file)
-    eval = regularize(aig, lib_file, eval)
-    print(circuit_name, '-', actions, ' ', eval)
-    return eval
-
-def getPath(circuit_name):
-    print("beam_search:")
-    beam_score, beam_actions = beam_search(circuit_name, 10, 3)
-    best_score = beam_score
-    print(beam_score, ' * ', beam_actions)
-    print("A_star:")
-    astar_score, astar_actions = Astar(circuit_name, 3)
-    if best_score < astar_score:
-        best_score = astar_score
-    print(astar_score, ' * ', astar_actions)
-    print("MCTS:")
-    mcts_score, mcts_actions = whole_MCTS(circuit_name, 3, 50)
-    if best_score < mcts_score:
-        best_score = mcts_score
-    print(mcts_score, ' * ', mcts_actions)
-    
-    print("dfs:")
-    dfs_score, dfs_actions = dfs(circuit_name, 0, "", best_score * 0.5, "", 3)
-    if best_score < dfs_score:
-        best_score = dfs_score
-    print(dfs_score, ' * ', dfs_actions)
-    print("bfs:")
-    bfs_score, bfs_actions = bfs(circuit_name, best_score * 0.5, "", 3)
-    if best_score < bfs_score:
-        best_score = bfs_score
-    print(bfs_score, ' * ', bfs_actions)
-    
-    # final actions select
+    # basic two search
+    _, beam_actions = beam_search(circuit_name, 10, 5)
     beam_score = calc(circuit_name, beam_actions)
+    _, astar_actions = Astar(circuit_name, 10)
     astar_score = calc(circuit_name, astar_actions)
+    
+    if (best_score >= threshold):
+        print(circuit_name, '_', best_actions, ' : ', best_score)
+        return
+    
+    # fix 1 - MCTS
+    _, mcts_actions = whole_MCTS(circuit_name, 10, 50)
     mcts_score = calc(circuit_name, mcts_actions)
+
+    if (best_score >= threshold):
+        print(circuit_name, '_', best_actions, ' : ', best_score)
+        return
+    
+    # fix 2 - dfs / bfs
+    _, dfs_actions = dfs(circuit_name, len(best_actions), best_actions, best_score * 0.6, best_actions, 10, -1)
     dfs_score = calc(circuit_name, dfs_actions)
+    _, bfs_actions = bfs(circuit_name, best_score * 0.6, best_actions, 10)
     bfs_score = calc(circuit_name, bfs_actions)
     
-    best_score = beam_score
-    best_actions = beam_actions
-    if best_score < astar_score:
-        best_score = astar_score
-        best_actions = astar_actions
-    if best_score < mcts_score:
-        best_score = mcts_score
-        best_actions = mcts_actions
-    if best_score < dfs_score:
-        best_score = dfs_score
-        best_actions = dfs_actions
-    if best_score < bfs_score:
-        best_score = bfs_score
-        best_actions = bfs_actions
-    
-    print(best_score, ' * ', best_actions)
-    
+    print(circuit_name, '_', best_actions, ' : ', best_score)
 
-getPath("alu2")
+import os
+
+def extract_aig_filenames(directory):
+    files = os.listdir(directory)
+    aig_files = [os.path.splitext(file)[0] for file in files if file.endswith('.aig')]
+    return aig_files
+
+pathA = "./InitialAIG/test/"
+aig_filenames = extract_aig_filenames(pathA)
+print(aig_filenames)
+
+for file_name in aig_filenames:
+    getPath(file_name)
